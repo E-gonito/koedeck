@@ -9,11 +9,18 @@ from pathlib import Path
 
 from nicegui import app, ui
 
-from .config import generate_config
+from .config import generate_config, load_config
 from .exporter import export_project
-from .models import Project
+from .models import Line, Project
 from .parser import parse_markdown
 from .reimport import reimport_markdown
+from .tagger import (
+    TaggingSession,
+    TagResult,
+    TagStatus,
+    tag_episode,
+    tag_single_line,
+)
 
 # ---------------------------------------------------------------------------
 # State
@@ -24,6 +31,7 @@ PROJECT_FILE = Path("project.json")
 _project: Project | None = None
 _save_timer: asyncio.TimerHandle | None = None
 _save_indicator_timer: asyncio.TimerHandle | None = None
+_tagging_session: TaggingSession | None = None
 
 
 def _get_project() -> Project | None:
@@ -60,7 +68,7 @@ def _save_project_sync() -> None:
 
 
 # ---------------------------------------------------------------------------
-# UI Components
+# UI Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -69,7 +77,6 @@ def _schedule_autosave(save_label: ui.label) -> None:
     global _save_timer, _save_indicator_timer
     loop = asyncio.get_event_loop()
 
-    # Cancel previous timer
     if _save_timer is not None:
         _save_timer.cancel()
 
@@ -79,29 +86,20 @@ def _schedule_autosave(save_label: ui.label) -> None:
         save_label.text = "✓ saved"
         save_label.classes(replace="text-green-500 text-xs transition-opacity opacity-100")
 
-        # Fade the indicator after 2s
         if _save_indicator_timer is not None:
             _save_indicator_timer.cancel()
         _save_indicator_timer = loop.call_later(
             2.0,
-            lambda: (
-                save_label.classes(replace="text-green-500 text-xs transition-opacity opacity-0"),
+            lambda: save_label.classes(
+                replace="text-green-500 text-xs transition-opacity opacity-0"
             ),
         )
 
     _save_timer = loop.call_later(1.0, do_save)
 
 
-def _is_line_stale(line) -> bool:
+def _is_line_stale(line: Line) -> bool:
     """Check if a line's audio is stale (text changed since generation)."""
-    if line.audio.audio_hash is None:
-        return False
-    # If audio exists but hash was computed from different text, it's stale
-    # We can't recompute the full hash here (missing voice_id etc.) but we can
-    # check if the file exists and the text field on the line differs from
-    # what was used. For now, we mark stale if audio_hash exists but text changed.
-    # The actual hash comparison happens at generation time.
-    # Simple heuristic: if there's audio but tagged_text/text may have changed
     return line.audio.current_file is not None and line.audio.audio_hash is not None
 
 
@@ -120,7 +118,7 @@ async def index_page():
             _set_project(proj)
 
     if _get_project() is not None:
-        _build_editor_page()
+        ui.navigate.to("/editor")
     else:
         _build_import_page()
 
@@ -141,17 +139,15 @@ def _build_import_page():
 
         with ui.card().classes("w-full p-6"):
             ui.label("Import script").classes("text-lg font-semibold mb-2")
-            ui.label(
-                "Select a .md file with dialogue in SPEAKER: format."
-            ).classes("text-sm text-gray-400 mb-4")
-
-            upload = ui.upload(
+            ui.label("Select a .md file with dialogue in SPEAKER: format.").classes(
+                "text-sm text-gray-400 mb-4"
+            )
+            ui.upload(
                 label="Choose .md file",
                 auto_upload=True,
                 on_upload=_handle_upload,
             ).props('accept=".md"').classes("w-full")
 
-        # If there's an existing project, show option to re-import
         existing = _load_project()
         if existing is not None:
             with ui.card().classes("w-full p-6"):
@@ -160,44 +156,43 @@ def _build_import_page():
                     f"Source: {existing.source_path} • {len(existing.lines)} lines • "
                     f"{len(existing.characters)} characters"
                 ).classes("text-sm text-gray-400 mb-4")
-                ui.button("Open existing project", on_click=lambda: ui.navigate.to("/editor")).props(
-                    "outline"
-                )
+                ui.button(
+                    "Open existing project", on_click=lambda: ui.navigate.to("/editor")
+                ).props("outline")
 
 
 async def _handle_upload(e):
     """Handle markdown file upload."""
     content = e.content.read().decode("utf-8")
     filename = e.name
-
     existing = _get_project() or _load_project()
 
     if existing is not None:
-        # Re-import into existing project
         proj = reimport_markdown(content, existing)
         ui.notify(
-            f"Re-imported {filename}: {len([l for l in proj.lines if not l.orphaned])} active lines, "
+            f"Re-imported {filename}: "
+            f"{len([l for l in proj.lines if not l.orphaned])} active, "
             f"{len([l for l in proj.lines if l.orphaned])} orphaned",
             type="positive",
         )
     else:
-        # Fresh import
         proj = parse_markdown(content, filename)
         ui.notify(
             f"Imported {filename}: {len(proj.lines)} lines, {len(proj.characters)} characters",
             type="positive",
         )
 
-    # Generate config skeleton
     generate_config(proj)
-
-    # Save project
     _set_project(proj)
     _save_project_sync()
 
-    # Navigate to editor
     await asyncio.sleep(0.5)
     ui.navigate.to("/editor")
+
+
+# ---------------------------------------------------------------------------
+# Editor page
+# ---------------------------------------------------------------------------
 
 
 @ui.page("/editor")
@@ -211,7 +206,6 @@ async def editor_page():
         else:
             ui.navigate.to("/")
             return
-
     _build_editor_page()
 
 
@@ -232,9 +226,10 @@ def _build_editor_page():
         save_label = ui.label("").classes("text-green-500 text-xs transition-opacity opacity-0")
 
         with ui.row().classes("items-center gap-2"):
-            ui.button("Export .md", icon="download", on_click=lambda: _handle_export()).props(
-                "flat dense"
+            ui.button("Tag episode", icon="auto_awesome", on_click=_handle_tag_episode).props(
+                "dense color=purple"
             )
+            ui.button("Export .md", icon="download", on_click=_handle_export).props("flat dense")
             ui.button("Re-import", icon="upload", on_click=lambda: ui.navigate.to("/import")).props(
                 "flat dense"
             )
@@ -247,11 +242,8 @@ def _build_editor_page():
             character_tabs[char] = ui.tab(char)
 
     with ui.tab_panels(tabs, value=combined_tab).classes("w-full flex-grow"):
-        # Combined panel
         with ui.tab_panel(combined_tab).classes("p-4"):
             _build_line_list(proj, filter_char=None, save_label=save_label)
-
-        # Per-character panels
         for char, tab in character_tabs.items():
             with ui.tab_panel(tab).classes("p-4"):
                 _build_line_list(proj, filter_char=char, save_label=save_label)
@@ -268,7 +260,6 @@ def _build_line_list(proj: Project, filter_char: str | None, save_label: ui.labe
             for line in lines:
                 _build_line_card(line, save_label, show_index=(filter_char is not None))
 
-    # Show orphaned lines at bottom if in combined view
     if filter_char is None:
         orphaned = [l for l in proj.lines if l.orphaned]
         if orphaned:
@@ -279,77 +270,84 @@ def _build_line_list(proj: Project, filter_char: str | None, save_label: ui.labe
                     _build_orphan_card(line, save_label)
 
 
-def _build_line_card(line, save_label: ui.label, show_index: bool = False):
+def _build_line_card(line: Line, save_label: ui.label, show_index: bool = False):
     """Build an editable card for a single line."""
     is_stale = _is_line_stale(line)
-
     card_classes = "w-full p-3"
     if is_stale:
         card_classes += " border-l-4 border-amber-500"
 
     with ui.card().classes(card_classes):
         if line.type == "direction":
-            # Directions: dimmed, italic, not editable (they're stage directions)
             with ui.row().classes("items-center gap-2 w-full"):
                 if show_index:
                     ui.label(f"#{line.global_index}").classes("text-xs text-gray-600 font-mono")
                 ui.label(line.text).classes("italic text-gray-500 w-full")
         else:
-            # Dialogue: editable
+            # Header row
             with ui.row().classes("items-center gap-2 w-full"):
                 if show_index:
                     ui.label(f"#{line.global_index}").classes(
                         "text-xs text-gray-600 font-mono min-w-[2rem]"
                     )
-
-                # Character badge
                 ui.badge(line.character).classes("text-xs")
 
-                # Stale indicator
                 if is_stale:
                     ui.icon("warning", size="xs").classes("text-amber-500").tooltip(
-                        "Audio is stale — text changed since last generation"
+                        "Audio stale — text changed since generation"
                     )
-
-                # Audio indicator
                 if line.audio.current_file:
                     ui.icon("volume_up", size="xs").classes("text-green-600")
+                if line.tagged_text:
+                    ui.icon("label", size="xs").classes("text-purple-400").tooltip(
+                        "Tagged"
+                    )
 
-            # Editable text area with parentheticals shown inline
+                # Spacer
+                ui.element("div").classes("flex-grow")
+
+                # Per-line tag button
+                ui.button(
+                    icon="auto_awesome",
+                    on_click=lambda ln=line: _handle_tag_line(ln),
+                ).props("flat dense round size=sm color=purple").tooltip("Tag this line")
+
+            # Editable text area
             display_text = _build_display_text(line)
-
-            textarea = ui.textarea(
-                value=display_text,
-            ).classes("w-full mt-1").props('autogrow dense outlined')
-
-            # On change: parse editable text back, update line, trigger autosave
+            textarea = ui.textarea(value=display_text).classes("w-full mt-1").props(
+                "autogrow dense outlined"
+            )
             textarea.on(
                 "update:model-value",
                 lambda e, ln=line: _handle_text_change(e, ln, save_label),
             )
 
+            # Show tagged text if present
+            if line.tagged_text:
+                with ui.row().classes("items-center gap-1 mt-1"):
+                    ui.icon("label", size="xs").classes("text-purple-400")
+                    ui.label(line.tagged_text).classes(
+                        "text-xs text-purple-300 font-mono bg-purple-900/30 px-2 py-1 rounded"
+                    )
 
-def _build_orphan_card(line, save_label: ui.label):
-    """Build a card for an orphaned line with resolve options."""
+
+def _build_orphan_card(line: Line, save_label: ui.label):
+    """Build a card for an orphaned line."""
     with ui.card().classes("w-full p-3 bg-amber-900/20 border border-amber-700"):
         with ui.row().classes("items-center gap-2 w-full"):
             if line.character:
                 ui.badge(line.character).classes("text-xs")
             ui.label(line.text).classes("text-gray-400 flex-grow")
-
-            # Resolve buttons
             ui.button(
                 icon="delete",
                 on_click=lambda ln=line: _delete_orphan(ln, save_label),
             ).props("flat dense round").tooltip("Delete permanently")
 
 
-def _build_display_text(line) -> str:
+def _build_display_text(line: Line) -> str:
     """Build display text with parentheticals re-inserted for editing."""
     if not line.parentheticals:
         return line.text
-
-    # Re-insert parentheticals at their offsets for display
     result = line.text
     sorted_parens = sorted(line.parentheticals, key=lambda p: p.offset, reverse=True)
     for paren in sorted_parens:
@@ -359,41 +357,33 @@ def _build_display_text(line) -> str:
         sep_before = " " if before and not before.endswith(" ") else ""
         sep_after = " " if after and not after.startswith(" ") else ""
         result = before + sep_before + paren.text + sep_after + after
-
     return result
 
 
-def _handle_text_change(e, line, save_label: ui.label):
+def _handle_text_change(e, line: Line, save_label: ui.label):
     """Handle text edit: re-parse parentheticals, update line, trigger autosave."""
     import re
 
     new_text = e.args if isinstance(e.args, str) else str(e.args)
-
-    # Extract parentheticals from the edited text
-    from .parser import _PAREN_RE, _extract_parentheticals_v2
+    from .parser import _extract_parentheticals_v2
 
     clean_text, parentheticals = _extract_parentheticals_v2(new_text)
 
-    # Update line (ID stays the same!)
     line.text = clean_text
     line.parentheticals = parentheticals
     line.raw_text = f"{line.character}: {new_text}" if line.character else new_text
 
-    # If text changed and there was tagged_text, invalidate it
-    # (tagged_text was for the old text)
+    # Invalidate tagged_text if text changed
     if line.tagged_text is not None:
-        # Check if stripping tags from tagged_text still matches
-        import re as _re
+        from .tagger import strip_tags
 
-        stripped = _re.sub(r"\[.*?\]", "", line.tagged_text)
-        if stripped != clean_text:
+        if strip_tags(line.tagged_text) != clean_text:
             line.tagged_text = None
 
-    # Trigger debounced autosave
     _schedule_autosave(save_label)
 
 
-def _delete_orphan(line, save_label: ui.label):
+def _delete_orphan(line: Line, save_label: ui.label):
     """Remove an orphaned line from the project."""
     proj = _get_project()
     if proj is None:
@@ -401,7 +391,6 @@ def _delete_orphan(line, save_label: ui.label):
     proj.lines = [l for l in proj.lines if l.line_id != line.line_id]
     _schedule_autosave(save_label)
     ui.notify("Orphaned line removed", type="info")
-    # Refresh the page
     ui.navigate.to("/editor")
 
 
@@ -411,16 +400,340 @@ async def _handle_export():
     if proj is None:
         ui.notify("No project loaded", type="warning")
         return
-
     content = export_project(proj)
-    # Determine filename
     source = Path(proj.source_path)
-    export_name = source.stem + "_exported" + source.suffix if source.suffix else source.name + "_exported.md"
-
-    # Write to temp file and trigger download
+    export_name = (
+        source.stem + "_exported" + source.suffix
+        if source.suffix
+        else source.name + "_exported.md"
+    )
     tmp = Path(tempfile.mkdtemp()) / export_name
     tmp.write_text(content)
     ui.download(str(tmp), filename=export_name)
+
+
+# ---------------------------------------------------------------------------
+# Tagging UI
+# ---------------------------------------------------------------------------
+
+
+async def _handle_tag_episode():
+    """Start batch tagging all dialogue lines, then show diff review."""
+    global _tagging_session
+    proj = _get_project()
+    if proj is None:
+        ui.notify("No project loaded", type="warning")
+        return
+
+    try:
+        config = load_config()
+    except FileNotFoundError:
+        ui.notify("config.yaml not found — import a script first", type="negative")
+        return
+
+    session = TaggingSession()
+    _tagging_session = session
+
+    # Show progress dialog
+    dialog = ui.dialog().props("persistent")
+    with dialog, ui.card().classes("w-96 p-6"):
+        ui.label("Tagging episode...").classes("text-lg font-semibold")
+        progress_label = ui.label("Starting...").classes("text-sm text-gray-400")
+        progress_bar = ui.linear_progress(value=0, show_value=False).classes("w-full")
+
+        cancel_btn = ui.button(
+            "Cancel", on_click=lambda: _cancel_tagging(session, dialog)
+        ).props("flat color=red")
+
+    dialog.open()
+
+    def on_progress(s: TaggingSession):
+        if s.total > 0:
+            progress_bar.value = s.completed / s.total
+            progress_label.text = f"{s.completed}/{s.total} lines processed"
+
+    # Run tagging
+    await tag_episode(proj, config, session, max_concurrent=2, on_progress=on_progress)
+
+    dialog.close()
+
+    if session.cancelled:
+        ui.notify("Tagging cancelled", type="warning")
+        return
+
+    # Show diff review
+    successful = [r for r in session.results.values() if r.status == TagStatus.SUCCESS]
+    failed = [r for r in session.results.values() if r.status == TagStatus.FAILED]
+
+    if not successful and not failed:
+        ui.notify("No lines to tag", type="info")
+        return
+
+    if failed:
+        ui.notify(
+            f"{len(failed)} line(s) failed tagging — shown as 'needs manual tags'",
+            type="warning",
+        )
+
+    # Navigate to diff review page
+    ui.navigate.to("/review")
+
+
+async def _handle_tag_line(line: Line):
+    """Tag a single line and show inline diff review."""
+    proj = _get_project()
+    if proj is None:
+        return
+
+    try:
+        config = load_config()
+    except FileNotFoundError:
+        ui.notify("config.yaml not found", type="negative")
+        return
+
+    # Get preceding lines for context
+    all_lines = [l for l in proj.lines if not l.orphaned]
+    line_idx = next((i for i, l in enumerate(all_lines) if l.line_id == line.line_id), 0)
+    preceding = all_lines[max(0, line_idx - 2) : line_idx]
+
+    # Show a small loading indicator
+    ui.notify("Tagging line...", type="info", timeout=1500)
+
+    result = await tag_single_line(line, preceding, config)
+
+    if result.status == TagStatus.SUCCESS and result.tagged_text:
+        # Show inline accept/reject dialog
+        _show_single_line_review(line, result)
+    else:
+        ui.notify(
+            f"Tagging failed: {result.error or 'unknown error'}",
+            type="negative",
+            timeout=5000,
+        )
+
+
+def _show_single_line_review(line: Line, result: TagResult):
+    """Show a dialog to accept/reject a single line's tagging result."""
+    dialog = ui.dialog()
+    with dialog, ui.card().classes("w-full max-w-2xl p-6"):
+        ui.label("Review tagged line").classes("text-lg font-semibold mb-2")
+
+        # Original
+        with ui.row().classes("items-start gap-2 w-full"):
+            ui.label("Original:").classes("text-sm text-gray-400 min-w-[5rem]")
+            ui.label(result.original_text).classes("text-sm font-mono")
+
+        # Tagged
+        with ui.row().classes("items-start gap-2 w-full mt-2"):
+            ui.label("Tagged:").classes("text-sm text-purple-400 min-w-[5rem]")
+            ui.label(result.tagged_text).classes("text-sm font-mono text-purple-300")
+
+        # Buttons
+        with ui.row().classes("gap-2 mt-4 justify-end"):
+            ui.button("Reject", on_click=dialog.close).props("flat color=red")
+
+            def accept():
+                line.tagged_text = result.tagged_text
+                _save_project_sync()
+                dialog.close()
+                ui.notify("Tag accepted", type="positive")
+                ui.navigate.to("/editor")
+
+            ui.button("Accept", on_click=accept).props("color=purple")
+
+    dialog.open()
+
+
+def _cancel_tagging(session: TaggingSession, dialog):
+    """Cancel an in-progress tagging session."""
+    session.cancelled = True
+    dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# Diff review page
+# ---------------------------------------------------------------------------
+
+
+@ui.page("/review")
+async def review_page():
+    """Diff review page: shows all tagging results for acceptance."""
+    global _tagging_session
+    proj = _get_project()
+    session = _tagging_session
+
+    if proj is None or session is None:
+        ui.navigate.to("/editor")
+        return
+
+    ui.dark_mode(True)
+
+    # Collect results with their lines
+    successful_results: list[tuple[Line, TagResult]] = []
+    failed_results: list[tuple[Line, TagResult]] = []
+
+    line_map = {l.line_id: l for l in proj.lines}
+    for result in session.results.values():
+        line = line_map.get(result.line_id)
+        if line is None:
+            continue
+        if result.status == TagStatus.SUCCESS:
+            successful_results.append((line, result))
+        elif result.status == TagStatus.FAILED:
+            failed_results.append((line, result))
+
+    # Sort by global_index
+    successful_results.sort(key=lambda x: x[0].global_index)
+    failed_results.sort(key=lambda x: x[0].global_index)
+
+    # Track acceptance state
+    accepted: dict[str, bool] = {}  # line_id -> accepted?
+    edited_text: dict[str, str] = {}  # line_id -> edited tagged text
+
+    with ui.header().classes("bg-gray-900 items-center justify-between px-6"):
+        with ui.row().classes("items-center gap-4"):
+            ui.label("koedeck").classes("text-xl font-bold")
+            ui.label("— Diff review").classes("text-gray-400 text-sm")
+
+        with ui.row().classes("items-center gap-2"):
+            ui.button(
+                "Accept all",
+                icon="done_all",
+                on_click=lambda: _accept_all(proj, successful_results, dialog_ref),
+            ).props("dense color=purple")
+            ui.button(
+                "Back to editor",
+                icon="arrow_back",
+                on_click=lambda: ui.navigate.to("/editor"),
+            ).props("flat dense")
+
+    # Placeholder for dialog ref
+    dialog_ref = {"done": False}
+
+    with ui.scroll_area().classes("w-full").style("height: calc(100vh - 80px)"):
+        with ui.column().classes("w-full gap-3 max-w-4xl mx-auto p-4"):
+            # Summary
+            ui.label(
+                f"{len(successful_results)} tagged successfully • "
+                f"{len(failed_results)} failed"
+            ).classes("text-sm text-gray-400 mb-2")
+
+            # Successful results with Accept/Edit/Reject
+            for line, result in successful_results:
+                _build_review_card(line, result, accepted, edited_text, proj)
+
+            # Failed results
+            if failed_results:
+                ui.separator().classes("my-4")
+                ui.label("Failed (needs manual tags)").classes(
+                    "text-lg font-semibold text-amber-400"
+                )
+                for line, result in failed_results:
+                    _build_failed_card(line, result)
+
+
+def _build_review_card(
+    line: Line,
+    result: TagResult,
+    accepted: dict,
+    edited_text: dict,
+    proj: Project,
+):
+    """Build a diff review card for a single successful tagging result."""
+    card = ui.card().classes("w-full p-4")
+    with card:
+        # Header
+        with ui.row().classes("items-center gap-2 mb-2"):
+            ui.badge(line.character).classes("text-xs")
+            ui.label(f"#{line.global_index}").classes("text-xs text-gray-600 font-mono")
+
+        # Original text
+        with ui.row().classes("items-start gap-2 w-full"):
+            ui.label("Original:").classes("text-xs text-gray-500 min-w-[5rem]")
+            ui.label(result.original_text).classes("text-sm font-mono text-gray-300")
+
+        # Tagged text (editable)
+        with ui.row().classes("items-start gap-2 w-full mt-1"):
+            ui.label("Tagged:").classes("text-xs text-purple-400 min-w-[5rem]")
+            tag_input = ui.input(value=result.tagged_text or "").classes(
+                "flex-grow font-mono text-sm"
+            ).props("dense outlined")
+            tag_input.on(
+                "update:model-value",
+                lambda e, lid=line.line_id: edited_text.update({lid: e.args}),
+            )
+
+        # Action buttons
+        with ui.row().classes("gap-2 mt-2 justify-end"):
+            reject_btn = ui.button("Reject", icon="close").props("flat dense color=red")
+            accept_btn = ui.button("Accept", icon="check").props("dense color=purple")
+
+            # Status indicator
+            status_label = ui.label("").classes("text-xs self-center")
+
+            def do_accept(
+                ln=line,
+                res=result,
+                lbl=status_label,
+                crd=card,
+                lid=line.line_id,
+            ):
+                # Use edited text if available, otherwise original result
+                final_text = edited_text.get(lid, res.tagged_text)
+                ln.tagged_text = final_text
+                accepted[lid] = True
+                lbl.text = "✓ accepted"
+                lbl.classes(replace="text-xs text-green-400 self-center")
+                crd.classes(replace="w-full p-4 border-l-4 border-green-600")
+                _save_project_sync()
+
+            def do_reject(
+                ln=line,
+                lbl=status_label,
+                crd=card,
+                lid=line.line_id,
+            ):
+                accepted[lid] = False
+                lbl.text = "✗ rejected"
+                lbl.classes(replace="text-xs text-red-400 self-center")
+                crd.classes(replace="w-full p-4 border-l-4 border-red-600 opacity-50")
+
+            accept_btn.on_click(do_accept)
+            reject_btn.on_click(do_reject)
+
+
+def _build_failed_card(line: Line, result: TagResult):
+    """Build a card for a line that failed tagging."""
+    with ui.card().classes("w-full p-4 border-l-4 border-amber-500"):
+        with ui.row().classes("items-center gap-2 mb-2"):
+            ui.badge(line.character).classes("text-xs")
+            ui.label(f"#{line.global_index}").classes("text-xs text-gray-600 font-mono")
+            ui.icon("warning", size="xs").classes("text-amber-400")
+            ui.label("needs manual tags").classes("text-xs text-amber-400")
+
+        ui.label(result.original_text).classes("text-sm font-mono text-gray-300")
+
+        if result.error:
+            ui.label(f"Error: {result.error}").classes("text-xs text-red-400 mt-1")
+
+        ui.label(f"Attempts: {result.attempts}/3").classes("text-xs text-gray-500")
+
+
+def _accept_all(
+    proj: Project,
+    results: list[tuple[Line, TagResult]],
+    dialog_ref: dict,
+):
+    """Accept all successful tagging results."""
+    count = 0
+    for line, result in results:
+        if result.tagged_text:
+            line.tagged_text = result.tagged_text
+            count += 1
+
+    _save_project_sync()
+    ui.notify(f"Accepted {count} tagged lines", type="positive")
+    ui.navigate.to("/editor")
 
 
 # ---------------------------------------------------------------------------
