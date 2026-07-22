@@ -34,6 +34,8 @@ from .generator import (
     generate_single_line,
     get_ffmpeg_error_message,
 )
+from .setup import run_all_checks, is_first_launch, CheckStatus
+from .validator import validate_script, apply_auto_fixes
 
 # ---------------------------------------------------------------------------
 # State
@@ -46,6 +48,7 @@ _save_timer: asyncio.TimerHandle | None = None
 _save_indicator_timer: asyncio.TimerHandle | None = None
 _tagging_session: TaggingSession | None = None
 _generation_session: GenerationSession | None = None
+_pending_script: str | None = None  # Raw script text awaiting cleanup
 
 
 def _get_project() -> Project | None:
@@ -130,7 +133,12 @@ def _is_line_stale(line: Line) -> bool:
 
 @ui.page("/")
 async def index_page():
-    """Main page: either show import or editor."""
+    """Main page: route to setup, import, or editor."""
+    # First launch: go to setup wizard
+    if is_first_launch():
+        ui.navigate.to("/setup")
+        return
+
     proj = _get_project()
     if proj is None:
         proj = _load_project()
@@ -207,6 +215,216 @@ async def _handle_upload(e):
     _save_project_sync()
 
     await asyncio.sleep(0.5)
+    # For fresh imports, go through cleanup screen first
+    if existing is None:
+        global _pending_script
+        _pending_script = content
+        ui.navigate.to("/cleanup")
+    else:
+        ui.navigate.to("/editor")
+
+
+# ---------------------------------------------------------------------------
+# Setup wizard page
+# ---------------------------------------------------------------------------
+
+
+@ui.page("/setup")
+async def setup_page():
+    """Onboarding wizard that validates all dependencies."""
+    ui.dark_mode(True)
+
+    with ui.column().classes("w-full max-w-2xl mx-auto p-8 gap-6"):
+        ui.label("koedeck").classes("text-3xl font-bold")
+        ui.label("Setup wizard").classes("text-xl text-gray-400")
+        ui.label(
+            "Let's make sure everything is configured before you start."
+        ).classes("text-gray-500")
+
+        # Check results container
+        checks_container = ui.column().classes("w-full gap-3")
+
+        with checks_container:
+            with ui.card().classes("w-full p-4"):
+                ui.label("Running checks...").classes("text-gray-400")
+                ui.spinner()
+
+        # Run checks
+        status = await run_all_checks()
+
+        # Clear and show results
+        checks_container.clear()
+
+        with checks_container:
+            for check in status.checks:
+                _build_check_card(check)
+
+            ui.separator().classes("my-4")
+
+            if status.all_passed:
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("check_circle", size="md").classes("text-green-500")
+                    ui.label("All checks passed! Ready to go.").classes("text-green-400 text-lg")
+
+                ui.button(
+                    "Continue to import", icon="arrow_forward",
+                    on_click=lambda: ui.navigate.to("/import"),
+                ).props("color=green").classes("mt-4")
+            else:
+                failures = status.critical_failures
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("warning", size="md").classes("text-amber-400")
+                    ui.label(f"{len(failures)} issue(s) need attention").classes("text-amber-400 text-lg")
+
+                with ui.row().classes("gap-2 mt-4"):
+                    ui.button(
+                        "Re-run checks", icon="refresh",
+                        on_click=lambda: ui.navigate.to("/setup"),
+                    ).props("outline")
+                    ui.button(
+                        "Continue anyway", icon="arrow_forward",
+                        on_click=lambda: ui.navigate.to("/import"),
+                    ).props("flat")
+
+
+def _build_check_card(check):
+    """Build a card showing a single check result."""
+    color_map = {
+        CheckStatus.PASS: ("check_circle", "text-green-500", "bg-green-900/20"),
+        CheckStatus.FAIL: ("cancel", "text-red-500", "bg-red-900/20"),
+        CheckStatus.WARN: ("warning", "text-amber-400", "bg-amber-900/20"),
+        CheckStatus.SKIP: ("remove_circle", "text-gray-500", "bg-gray-800"),
+    }
+    icon_name, icon_color, bg_color = color_map.get(
+        check.status, ("help", "text-gray-500", "bg-gray-800")
+    )
+
+    with ui.card().classes(f"w-full p-3 {bg_color}"):
+        with ui.row().classes("items-center gap-3 w-full"):
+            ui.icon(icon_name, size="sm").classes(icon_color)
+            with ui.column().classes("flex-grow gap-0"):
+                ui.label(check.name).classes("font-medium text-sm")
+                ui.label(check.message).classes("text-xs text-gray-400")
+            if check.fix_hint:
+                ui.label(check.fix_hint).classes(
+                    "text-xs font-mono bg-gray-800 px-2 py-1 rounded text-gray-300"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Script cleanup page
+# ---------------------------------------------------------------------------
+
+
+@ui.page("/cleanup")
+async def cleanup_page():
+    """Script validation and cleanup screen shown after import."""
+    global _pending_script
+    proj = _get_project()
+    if proj is None or _pending_script is None:
+        ui.navigate.to("/editor")
+        return
+
+    script_text = _pending_script
+    validation = validate_script(script_text)
+
+    ui.dark_mode(True)
+
+    with ui.column().classes("w-full max-w-3xl mx-auto p-8 gap-6"):
+        ui.label("koedeck").classes("text-3xl font-bold")
+        ui.label("Script cleanup").classes("text-xl text-gray-400")
+
+        # Stats summary
+        with ui.card().classes("w-full p-4"):
+            with ui.row().classes("gap-6"):
+                with ui.column().classes("gap-0"):
+                    ui.label(str(validation.stats.get("dialogue_lines", 0))).classes("text-2xl font-bold text-green-400")
+                    ui.label("dialogue lines").classes("text-xs text-gray-500")
+                with ui.column().classes("gap-0"):
+                    ui.label(str(validation.stats.get("direction_lines", 0))).classes("text-2xl font-bold text-blue-400")
+                    ui.label("directions").classes("text-xs text-gray-500")
+                with ui.column().classes("gap-0"):
+                    ui.label(str(validation.stats.get("character_count", 0))).classes("text-2xl font-bold text-purple-400")
+                    ui.label("characters").classes("text-xs text-gray-500")
+                with ui.column().classes("gap-0"):
+                    chars = validation.stats.get("characters", [])
+                    ui.label(", ".join(chars[:5])).classes("text-sm text-gray-300")
+                    if len(chars) > 5:
+                        ui.label(f"...+{len(chars)-5} more").classes("text-xs text-gray-500")
+
+        # Issues
+        if validation.issues:
+            with ui.card().classes("w-full p-4"):
+                with ui.row().classes("items-center justify-between mb-3"):
+                    ui.label(f"{len(validation.issues)} issue(s) found").classes("text-lg font-semibold")
+
+                    auto_fixable = [i for i in validation.issues if i.auto_fixable]
+                    if auto_fixable:
+                        async def do_auto_fix():
+                            global _pending_script
+                            fixed = apply_auto_fixes(script_text)
+                            _pending_script = fixed
+                            # Re-parse with fixed text
+                            new_proj = parse_markdown(fixed, proj.source_path)
+                            _set_project(new_proj)
+                            _save_project_sync()
+                            ui.notify(f"Applied {len(auto_fixable)} auto-fix(es)", type="positive")
+                            ui.navigate.to("/cleanup")
+
+                        ui.button(
+                            f"Auto-fix {len(auto_fixable)} issue(s)", icon="auto_fix_high",
+                            on_click=do_auto_fix,
+                        ).props("dense color=blue")
+
+                with ui.scroll_area().classes("max-h-80"):
+                    for issue in validation.issues:
+                        _build_issue_row(issue)
+        else:
+            with ui.card().classes("w-full p-4 bg-green-900/20"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("check_circle", size="sm").classes("text-green-500")
+                    ui.label("Script looks clean! No issues found.").classes("text-green-400")
+
+        # Action buttons
+        with ui.row().classes("gap-3 mt-2"):
+            ui.button(
+                "Continue to editor", icon="arrow_forward",
+                on_click=lambda: _finish_cleanup(),
+            ).props("color=green")
+            if validation.has_errors:
+                ui.label("(errors present — you may want to fix them first)").classes(
+                    "text-xs text-amber-400 self-center"
+                )
+
+
+def _build_issue_row(issue):
+    """Build a row for a single script issue."""
+    severity_colors = {
+        "error": ("cancel", "text-red-500"),
+        "warning": ("warning", "text-amber-400"),
+        "info": ("info", "text-blue-400"),
+    }
+    icon_name, icon_color = severity_colors.get(issue.severity.value, ("help", "text-gray-500"))
+
+    with ui.row().classes("items-start gap-2 py-2 border-b border-gray-800 w-full"):
+        ui.icon(icon_name, size="xs").classes(icon_color)
+        with ui.column().classes("flex-grow gap-0"):
+            with ui.row().classes("items-center gap-2"):
+                if issue.line_number > 0:
+                    ui.label(f"L{issue.line_number}").classes("text-xs font-mono text-gray-600")
+                ui.label(issue.message).classes("text-sm")
+            if issue.original_text:
+                ui.label(issue.original_text).classes("text-xs font-mono text-gray-500")
+            if issue.suggested_fix:
+                with ui.row().classes("items-center gap-1 mt-1"):
+                    ui.icon("arrow_forward", size="xs").classes("text-green-600")
+                    ui.label(issue.suggested_fix[:80]).classes("text-xs font-mono text-green-400")
+
+
+def _finish_cleanup():
+    """Finish cleanup and proceed to editor."""
+    global _pending_script
+    _pending_script = None
     ui.navigate.to("/editor")
 
 
