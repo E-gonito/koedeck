@@ -37,32 +37,119 @@ def _extract_parentheticals(text: str) -> tuple[str, list[Parenthetical]]:
 
     Returns:
         (clean_text, parentheticals) where clean_text has parentheticals removed
-        and each Parenthetical records its offset in the clean text.
+        and each Parenthetical records its offset in the *final* clean text
+        (after space normalization).
+
+    The offset represents the position in the clean text where the parenthetical
+    should be re-inserted during export.
     """
     parentheticals: list[Parenthetical] = []
     clean_parts: list[str] = []
     last_end = 0
-    clean_offset = 0
 
     for match in _PAREN_RE.finditer(text):
         # Add text before this parenthetical
         before = text[last_end : match.start()]
         clean_parts.append(before)
-        clean_offset += len(before)
-
-        # Record the parenthetical at the current clean offset
-        parentheticals.append(
-            Parenthetical(text=match.group(0), offset=clean_offset)
-        )
-
         last_end = match.end()
+
+        # Mark where this parenthetical goes: use a sentinel we'll find later
+        # We use a unique marker that won't appear in real text
+        marker = f"\x00PAREN{len(parentheticals)}\x00"
+        clean_parts.append(marker)
+
+        parentheticals.append(
+            Parenthetical(text=match.group(0), offset=0)  # offset computed below
+        )
 
     # Add remaining text after last parenthetical
     clean_parts.append(text[last_end:])
 
-    clean_text = "".join(clean_parts)
-    # Collapse multiple spaces that may result from removing parentheticals
+    # Join and normalize spaces
+    raw_joined = "".join(clean_parts)
+
+    # Now compute final offsets by finding markers in the normalized text
+    # First normalize spaces (but preserve markers)
+    normalized = re.sub(r"  +", " ", raw_joined).strip()
+
+    # Extract offsets from marker positions, then remove markers
+    for i, paren in enumerate(parentheticals):
+        marker = f"\x00PAREN{i}\x00"
+        pos = normalized.find(marker)
+        # The offset in the final clean text (without markers before this one)
+        # We need to account for all markers before this position
+        offset_adjustment = 0
+        for j in range(i):
+            prev_marker = f"\x00PAREN{j}\x00"
+            offset_adjustment += len(prev_marker)
+        paren.offset = pos - offset_adjustment
+
+    # Remove all markers to get the actual clean text
+    clean_text = normalized
+    for i in range(len(parentheticals)):
+        marker = f"\x00PAREN{i}\x00"
+        clean_text = clean_text.replace(marker, "")
+
+    # Final space cleanup after marker removal
     clean_text = re.sub(r"  +", " ", clean_text).strip()
+
+    # Adjust offsets for any space changes from marker removal
+    # Recompute by building text incrementally
+    # Actually let's just recompute correctly from scratch using a simpler approach
+    return _extract_parentheticals_v2(text)
+
+
+def _extract_parentheticals_v2(text: str) -> tuple[str, list[Parenthetical]]:
+    """Simpler parenthetical extraction with correct offset computation.
+
+    Strategy: build the clean text character by character, tracking positions.
+    When we encounter a parenthetical, record the current clean-text position.
+    """
+    parentheticals: list[Parenthetical] = []
+
+    # First, find all parenthetical spans
+    paren_spans: list[tuple[int, int, str]] = []
+    for match in _PAREN_RE.finditer(text):
+        paren_spans.append((match.start(), match.end(), match.group(0)))
+
+    if not paren_spans:
+        clean = re.sub(r"  +", " ", text).strip()
+        return clean, []
+
+    # Build clean text by removing parenthetical spans
+    clean_parts: list[str] = []
+    last_end = 0
+    offsets: list[int] = []
+
+    for start, end, paren_text in paren_spans:
+        before = text[last_end:start]
+        clean_parts.append(before)
+        # Record the current length as the offset for this parenthetical
+        current_clean_len = sum(len(p) for p in clean_parts)
+        offsets.append(current_clean_len)
+        last_end = end
+
+    clean_parts.append(text[last_end:])
+    raw_clean = "".join(clean_parts)
+
+    # Normalize spaces
+    clean_text = re.sub(r"  +", " ", raw_clean).strip()
+
+    # Adjust offsets for space normalization and stripping
+    # Find how much the start was stripped
+    lstrip_amount = len(raw_clean) - len(raw_clean.lstrip())
+
+    for i, (start, end, paren_text) in enumerate(paren_spans):
+        # Adjust offset for leading strip
+        adjusted = offsets[i] - lstrip_amount
+
+        # Adjust for space collapsing: count how many extra spaces were removed
+        # before this offset in the raw_clean
+        prefix = raw_clean[lstrip_amount : offsets[i]]
+        collapsed_prefix = re.sub(r"  +", " ", prefix)
+        adjusted = len(collapsed_prefix)
+
+        parentheticals.append(Parenthetical(text=paren_text, offset=adjusted))
 
     return clean_text, parentheticals
 
