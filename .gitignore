@@ -18,6 +18,7 @@ output/
 # Project data (local only)
 project.json
 config.yaml
+preferences.json
 
 # IDE
 .idea/

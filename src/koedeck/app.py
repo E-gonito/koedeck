@@ -34,6 +34,7 @@ from .generator import (
     generate_single_line,
     get_ffmpeg_error_message,
 )
+from .preferences import get_theme, set_theme, is_dark
 from .setup import run_all_checks, is_first_launch, CheckStatus
 from .validator import validate_script, apply_auto_fixes
 
@@ -159,7 +160,7 @@ async def import_page():
 
 def _build_import_page():
     """Build the import screen UI."""
-    ui.dark_mode(True)
+    ui.dark_mode(is_dark())
 
     with ui.column().classes("w-full max-w-2xl mx-auto p-8 gap-6"):
         ui.label("koedeck").classes("text-3xl font-bold")
@@ -232,7 +233,7 @@ async def _handle_upload(e):
 @ui.page("/setup")
 async def setup_page():
     """Onboarding wizard that validates all dependencies."""
-    ui.dark_mode(True)
+    ui.dark_mode(is_dark())
 
     with ui.column().classes("w-full max-w-2xl mx-auto p-8 gap-6"):
         ui.label("koedeck").classes("text-3xl font-bold")
@@ -328,7 +329,7 @@ async def cleanup_page():
     script_text = _pending_script
     validation = validate_script(script_text)
 
-    ui.dark_mode(True)
+    ui.dark_mode(is_dark())
 
     with ui.column().classes("w-full max-w-3xl mx-auto p-8 gap-6"):
         ui.label("koedeck").classes("text-3xl font-bold")
@@ -453,13 +454,13 @@ def _build_editor_page():
     if proj is None:
         return
 
-    ui.dark_mode(True)
+    ui.dark_mode(is_dark())
 
     # Top bar
-    with ui.header().classes("bg-gray-900 items-center justify-between px-6"):
+    with ui.header().classes("items-center justify-between px-6"):
         with ui.row().classes("items-center gap-4"):
             ui.label("koedeck").classes("text-xl font-bold")
-            ui.label(f"— {proj.source_path}").classes("text-gray-400 text-sm")
+            ui.label(f"— {proj.source_path}").classes("text-sm opacity-60")
 
         save_label = ui.label("").classes("text-green-500 text-xs transition-opacity opacity-0")
 
@@ -473,6 +474,17 @@ def _build_editor_page():
             ui.button("Export .md", icon="download", on_click=_handle_export).props("flat dense")
             ui.button("Re-import", icon="upload", on_click=lambda: ui.navigate.to("/import")).props(
                 "flat dense"
+            )
+
+            # Theme toggle
+            def toggle_theme():
+                new_theme = "light" if is_dark() else "dark"
+                set_theme(new_theme)
+                ui.navigate.to("/editor")
+
+            theme_icon = "dark_mode" if not is_dark() else "light_mode"
+            ui.button(icon=theme_icon, on_click=toggle_theme).props("flat dense round").tooltip(
+                "Toggle light/dark mode"
             )
 
     # Tabs
@@ -817,7 +829,7 @@ async def review_page():
         ui.navigate.to("/editor")
         return
 
-    ui.dark_mode(True)
+    ui.dark_mode(is_dark())
 
     # Collect results with their lines
     successful_results: list[tuple[Line, TagResult]] = []
@@ -841,7 +853,7 @@ async def review_page():
     accepted: dict[str, bool] = {}  # line_id -> accepted?
     edited_text: dict[str, str] = {}  # line_id -> edited tagged text
 
-    with ui.header().classes("bg-gray-900 items-center justify-between px-6"):
+    with ui.header().classes("items-center justify-between px-6"):
         with ui.row().classes("items-center gap-4"):
             ui.label("koedeck").classes("text-xl font-bold")
             ui.label("— Diff review").classes("text-gray-400 text-sm")
