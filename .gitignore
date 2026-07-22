@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+dist/
+*.egg-info/
+
+# Environment
+.env
+
+# Project outputs
+output/
+*.wav
+*.mp3
+
+# Project data (local only)
+project.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
