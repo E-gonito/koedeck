@@ -163,8 +163,8 @@ def _build_import_page():
 
 async def _handle_upload(e):
     """Handle markdown file upload."""
-    content = e.content.read().decode("utf-8")
-    filename = e.name
+    content = await e.file.text()
+    filename = e.file.name
     existing = _get_project() or _load_project()
 
     if existing is not None:
