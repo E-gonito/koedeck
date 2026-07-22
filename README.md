@@ -1,4 +1,6 @@
-# koedeck
+<p align="center">
+  <img width="600" height="350" alt="bc597149-d26c-4db4-be12-75dccb5178e7-2" src="https://github.com/user-attachments/assets/cd87a4c2-21e4-4fe4-9002-df45acd7a065" />
+</p>
 
 Script voice pipeline: import markdown dialogue scripts, edit in a tabbed web UI, auto-tag with ElevenLabs v3 emotion tags via a local LLM, and batch-generate WAV audio per line.
 
