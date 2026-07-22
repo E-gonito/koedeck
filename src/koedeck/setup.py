@@ -94,7 +94,7 @@ async def check_api_key_valid() -> CheckResult:
 def check_ffmpeg() -> CheckResult:
     if shutil.which("ffmpeg"):
         return CheckResult(name="ffmpeg", status=CheckStatus.PASS, message="ffmpeg found on PATH")
-    return CheckResult(name="ffmpeg", status=CheckStatus.FAIL, message="ffmpeg not found", fix_hint="Install with: brew install ffmpeg")
+    return CheckResult(name="ffmpeg", status=CheckStatus.WARN, message="ffmpeg not found (only needed for lower ElevenLabs tiers)", fix_hint="Optional: brew install ffmpeg")
 
 
 async def check_ollama_connectivity(base_url: str = "http://localhost:11434") -> CheckResult:

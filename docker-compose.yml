@@ -1,0 +1,18 @@
+# Optional: run Ollama via Docker if you don't have it installed natively.
+# Usage: docker compose up -d
+# Then koedeck will connect to it at http://localhost:11434 (the default).
+#
+# Note: On macOS, Docker cannot access the GPU — Ollama will run on CPU only.
+# For best performance on Mac, install Ollama natively: https://ollama.ai/
+
+services:
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 app = "koedeck.app:main"
+koedeck = "koedeck.app:main"
 
 [dependency-groups]
 dev = [
