@@ -4,7 +4,15 @@ Script voice pipeline: import markdown dialogue scripts, edit in a tabbed web UI
 
 ## Installation
 
-### One-command install (recommended)
+### Quick install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/E-gonito/koedeck/main/install.sh | bash
+```
+
+This installs uv (if needed), koedeck, checks for ffmpeg and Ollama, and pulls the LLM model.
+
+### Manual install
 
 ```bash
 uv tool install git+https://github.com/E-gonito/koedeck.git
@@ -18,7 +26,7 @@ koedeck
 
 > Need uv? `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
-### Developer install
+### Developer install (from source)
 
 ```bash
 git clone https://github.com/E-gonito/koedeck.git
