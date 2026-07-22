@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 from pathlib import Path
 
+from dotenv import load_dotenv
 from nicegui import app, ui
 
 from .config import generate_config, load_config
@@ -21,6 +23,17 @@ from .tagger import (
     tag_episode,
     tag_single_line,
 )
+from .generator import (
+    GenerationSession,
+    GenResult,
+    GenStatus,
+    PreflightSummary,
+    check_ffmpeg,
+    compute_preflight,
+    generate_episode,
+    generate_single_line,
+    get_ffmpeg_error_message,
+)
 
 # ---------------------------------------------------------------------------
 # State
@@ -32,6 +45,7 @@ _project: Project | None = None
 _save_timer: asyncio.TimerHandle | None = None
 _save_indicator_timer: asyncio.TimerHandle | None = None
 _tagging_session: TaggingSession | None = None
+_generation_session: GenerationSession | None = None
 
 
 def _get_project() -> Project | None:
@@ -41,6 +55,12 @@ def _get_project() -> Project | None:
 def _set_project(p: Project) -> None:
     global _project
     _project = p
+
+
+def _get_api_key() -> str | None:
+    """Load ElevenLabs API key from .env."""
+    load_dotenv()
+    return os.environ.get("ELEVENLABS_API_KEY")
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +246,9 @@ def _build_editor_page():
         save_label = ui.label("").classes("text-green-500 text-xs transition-opacity opacity-0")
 
         with ui.row().classes("items-center gap-2"):
+            ui.button("Generate", icon="mic", on_click=_handle_generate_episode).props(
+                "dense color=green"
+            )
             ui.button("Tag episode", icon="auto_awesome", on_click=_handle_tag_episode).props(
                 "dense color=purple"
             )
@@ -306,6 +329,12 @@ def _build_line_card(line: Line, save_label: ui.label, show_index: bool = False)
                 # Spacer
                 ui.element("div").classes("flex-grow")
 
+                # Per-line regenerate button
+                ui.button(
+                    icon="replay",
+                    on_click=lambda ln=line: _handle_regenerate_line(ln),
+                ).props("flat dense round size=sm color=green").tooltip("Regenerate audio")
+
                 # Per-line tag button
                 ui.button(
                     icon="auto_awesome",
@@ -329,6 +358,10 @@ def _build_line_card(line: Line, save_label: ui.label, show_index: bool = False)
                     ui.label(line.tagged_text).classes(
                         "text-xs text-purple-300 font-mono bg-purple-900/30 px-2 py-1 rounded"
                     )
+
+            # Audio player if file exists
+            if line.audio.current_file and Path(line.audio.current_file).exists():
+                ui.audio(line.audio.current_file).classes("w-full mt-1").props("dense")
 
 
 def _build_orphan_card(line: Line, save_label: ui.label):
@@ -734,6 +767,230 @@ def _accept_all(
     _save_project_sync()
     ui.notify(f"Accepted {count} tagged lines", type="positive")
     ui.navigate.to("/editor")
+
+
+# ---------------------------------------------------------------------------
+# Generation UI
+# ---------------------------------------------------------------------------
+
+
+async def _handle_generate_episode():
+    """Show pre-flight summary, then run batch generation."""
+    global _generation_session
+    proj = _get_project()
+    if proj is None:
+        ui.notify("No project loaded", type="warning")
+        return
+
+    api_key = _get_api_key()
+    if not api_key or api_key == "your-key-here":
+        ui.notify("Set ELEVENLABS_API_KEY in .env first", type="negative")
+        return
+
+    if not check_ffmpeg():
+        ui.notify(get_ffmpeg_error_message(), type="negative", timeout=8000)
+        return
+
+    try:
+        config = load_config()
+    except FileNotFoundError:
+        ui.notify("config.yaml not found — import a script first", type="negative")
+        return
+
+    # Compute pre-flight summary
+    preflight = compute_preflight(proj, config)
+
+    # Show pre-flight dialog
+    dialog = ui.dialog()
+    with dialog, ui.card().classes("w-[28rem] p-6"):
+        ui.label("Generate episode").classes("text-lg font-semibold mb-3")
+
+        if preflight.missing_voice_ids:
+            with ui.row().classes("items-center gap-2 mb-2"):
+                ui.icon("warning").classes("text-amber-400")
+                ui.label(
+                    f"Missing voice_id for: {', '.join(preflight.missing_voice_ids)}"
+                ).classes("text-sm text-amber-400")
+
+        with ui.column().classes("gap-1 mb-4"):
+            ui.label(f"Total dialogue lines: {preflight.total_lines}").classes("text-sm")
+            ui.label(f"Lines to generate: {preflight.lines_to_generate}").classes(
+                "text-sm text-green-400"
+            )
+            ui.label(f"Lines to skip (cached): {preflight.lines_to_skip}").classes(
+                "text-sm text-gray-400"
+            )
+            ui.label(f"Total characters: {preflight.total_characters:,}").classes("text-sm")
+            ui.label(
+                f"Estimated cost: ~{preflight.estimated_credits:,.0f} credits"
+            ).classes("text-sm text-blue-400")
+
+        with ui.row().classes("gap-2 justify-end"):
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+
+            can_generate = preflight.lines_to_generate > 0 and not preflight.missing_voice_ids
+
+            async def start_gen():
+                dialog.close()
+                await _run_generation(proj, config, api_key)
+
+            ui.button(
+                "Generate", on_click=start_gen
+            ).props(f"color=green {'disabled' if not can_generate else ''}")
+
+    dialog.open()
+
+
+async def _run_generation(proj: Project, config: dict, api_key: str):
+    """Run the batch generation with progress UI."""
+    global _generation_session
+
+    session = GenerationSession()
+    _generation_session = session
+
+    # Progress dialog
+    dialog = ui.dialog().props("persistent")
+    with dialog, ui.card().classes("w-96 p-6"):
+        ui.label("Generating audio...").classes("text-lg font-semibold")
+        progress_label = ui.label("Starting...").classes("text-sm text-gray-400")
+        progress_bar = ui.linear_progress(value=0, show_value=False).classes("w-full")
+        stats_label = ui.label("").classes("text-xs text-gray-500 mt-1")
+        ui.button(
+            "Cancel", on_click=lambda: _cancel_generation(session, dialog)
+        ).props("flat color=red")
+
+    dialog.open()
+
+    def on_progress(s: GenerationSession):
+        if s.total > 0:
+            progress_bar.value = s.completed / s.total
+            progress_label.text = f"{s.completed}/{s.total} lines"
+            stats_label.text = (
+                f"Done: {s.completed - s.skipped - s.failed} • "
+                f"Skipped: {s.skipped} • Failed: {s.failed}"
+            )
+
+    gen_config = config.get("generation", {})
+    max_concurrent = gen_config.get("max_concurrent_requests", 3)
+
+    await generate_episode(
+        proj, config, api_key, session,
+        max_concurrent=max_concurrent,
+        on_progress=on_progress,
+    )
+
+    dialog.close()
+
+    # Save project with updated audio state
+    _save_project_sync()
+
+    if session.cancelled:
+        ui.notify("Generation cancelled", type="warning")
+    else:
+        done = session.completed - session.skipped - session.failed
+        msg = f"Done: {done} generated, {session.skipped} cached, {session.failed} failed"
+        ui.notify(msg, type="positive" if session.failed == 0 else "warning", timeout=6000)
+
+        # If there are failures, offer retry
+        if session.failed > 0:
+            _show_retry_dialog(proj, config, api_key, session)
+
+    ui.navigate.to("/editor")
+
+
+def _show_retry_dialog(proj: Project, config: dict, api_key: str, session: GenerationSession):
+    """Show a dialog listing failed lines with a retry button."""
+    failed = [r for r in session.results.values() if r.status == GenStatus.FAILED]
+    if not failed:
+        return
+
+    dialog = ui.dialog()
+    with dialog, ui.card().classes("w-[30rem] p-6"):
+        ui.label(f"{len(failed)} line(s) failed").classes("text-lg font-semibold text-red-400")
+
+        with ui.scroll_area().classes("max-h-60 w-full"):
+            for result in failed:
+                with ui.row().classes("items-center gap-2 py-1"):
+                    ui.label(result.line_id).classes("text-xs font-mono text-gray-500")
+                    ui.label(result.error or "Unknown error").classes("text-xs text-red-300")
+
+        with ui.row().classes("gap-2 justify-end mt-4"):
+            ui.button("Dismiss", on_click=dialog.close).props("flat")
+
+            async def retry():
+                dialog.close()
+                await _retry_failed(proj, config, api_key, failed)
+
+            ui.button("Retry failed", on_click=retry).props("color=green")
+
+    dialog.open()
+
+
+async def _retry_failed(
+    proj: Project, config: dict, api_key: str, failed_results: list[GenResult]
+):
+    """Retry only the failed lines."""
+    line_map = {l.line_id: l for l in proj.lines}
+    session = GenerationSession()
+    session.total = len(failed_results)
+
+    import httpx
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for result in failed_results:
+            line = line_map.get(result.line_id)
+            if line is None:
+                continue
+            new_result = await generate_single_line(
+                line, config, api_key, session, client=client
+            )
+            session.results[line.line_id] = new_result
+            session.completed += 1
+
+    _save_project_sync()
+    done = sum(1 for r in session.results.values() if r.status == GenStatus.DONE)
+    ui.notify(f"Retry complete: {done}/{len(failed_results)} succeeded", type="info")
+    ui.navigate.to("/editor")
+
+
+async def _handle_regenerate_line(line: Line):
+    """Regenerate audio for a single line (force, creating a new take)."""
+    api_key = _get_api_key()
+    if not api_key or api_key == "your-key-here":
+        ui.notify("Set ELEVENLABS_API_KEY in .env first", type="negative")
+        return
+
+    if not check_ffmpeg():
+        ui.notify(get_ffmpeg_error_message(), type="negative")
+        return
+
+    try:
+        config = load_config()
+    except FileNotFoundError:
+        ui.notify("config.yaml not found", type="negative")
+        return
+
+    ui.notify("Regenerating...", type="info", timeout=2000)
+
+    session = GenerationSession()
+    result = await generate_single_line(
+        line, config, api_key, session, force=True
+    )
+
+    _save_project_sync()
+
+    if result.status == GenStatus.DONE:
+        ui.notify("Audio regenerated", type="positive")
+    else:
+        ui.notify(f"Failed: {result.error}", type="negative", timeout=5000)
+
+    ui.navigate.to("/editor")
+
+
+def _cancel_generation(session: GenerationSession, dialog):
+    """Cancel an in-progress generation."""
+    session.cancelled = True
+    dialog.close()
 
 
 # ---------------------------------------------------------------------------
